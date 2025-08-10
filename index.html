@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video + CSV-driven BLE Write (iOS WebBluetooth)</title>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Helvetica,Arial,sans-serif;line-height:1.5;padding:16px;max-width:720px;margin:auto">
+  <h2>動画 × CSV × BLE</h2>
+
+  <!-- 動画 -->
+  <section>
+    <video id="video" controls playsinline width="600" style="max-width:100%;background:#000"></video><br>
+    <label style="display:inline-block;margin-top:8px">
+      <input type="file" id="fileVideo" accept="video/*"> 動画を選択
+    </label>
+  </section>
+
+  <!-- CSV -->
+  <section style="margin-top:16px">
+    <label>
+      <input type="file" id="fileCsv" accept=".csv"> CSVを選択（ヘッダ無し / 1:時刻(100ms=1) 2:mode 3:speed）
+    </label>
+    <div id="csvInfo" style="font-size:12px;opacity:.8;margin-top:6px"></div>
+  </section>
+
+  <!-- BLE -->
+  <section style="margin-top:16px">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button id="btnConnect">🔗 Connect BLE</button>
+      <button id="btnDisconnect" disabled>🔌 Disconnect</button>
+      <span id="bleState" style="font-size:12px;opacity:.8"></span>
+    </div>
+    <details style="margin-top:6px">
+      <summary>UUID（編集可）</summary>
+      <div style="margin-top:8px">
+        <label>Service UUID:
+          <input id="svc" size="40" value="40EE1111-63EC-4B7F-8CE7-712EFD55B90E">
+        </label><br>
+        <label>Characteristic UUID:
+          <input id="chr" size="40" value="40EE2222-63EC-4B7F-8CE7-712EFD55B90E">
+        </label>
+      </div>
+    </details>
+  </section>
+
+  <pre id="log" style="white-space:pre-wrap;border:1px solid #ddd;padding:8px;margin-top:16px;height:260px;overflow:auto"></pre>
+
+<script>
+(()=> {
+  const $ = s=>document.querySelector(s);
+  const logEl = $('#log');
+  const log = (...a)=>{ logEl.textContent += a.join(' ')+'\n'; logEl.scrollTop = logEl.scrollHeight; };
+
+  /*** 動画読込 ***/
+  const video = $('#video');
+  $('#fileVideo').addEventListener('change', e=>{
+    const f = e.target.files?.[0];
+    if (!f) return;
+    video.src = URL.createObjectURL(f);
+    video.play().catch(()=>{});
+    log('Video loaded:', f.name, Math.round(f.size/1024)+'KB');
+  });
+
+  /*** CSV 読込 ***/
+  let rows = [];        // {t_ms:number, mode:0|1, speed:0..100}
+  let rowIdx = 0;       // 次に送る行のインデックス
+  let tickId = 0;       // setInterval ID
+
+  $('#fileCsv').addEventListener('change', async (e)=>{
+    const f = e.target.files?.[0];
+    if (!f) return;
+    try{
+      const text = await f.text();
+      rows = parseCsv(text);
+      rows.sort((a,b)=>a.t_ms-b.t_ms); // 念のため昇順
+      rowIdx = 0;
+      $('#csvInfo').textContent = `${f.name}: ${rows.length} 行 / 先頭 ${rows[0]?.t_ms ?? '-'}ms, 末尾 ${rows.at(-1)?.t_ms ?? '-'}ms`;
+      log('CSV loaded:', f.name, 'rows=', rows.length);
+      // 動画メタやシーク完了後にインデックスを追随
+      resetIndexToVideoTime();
+    }catch(err){
+      log('ERROR(csv):', err?.message||err);
+    }
+  });
+
+  function parseCsv(text){
+    const out = [];
+    const lines = text.split(/\r?\n/);
+    for (const line of lines){
+      if (!line.trim()) continue;
+      const parts = line.split(',').map(s=>s.trim());
+      if (parts.length < 3) continue;
+      const tsUnit = Number(parts[0]);           // 100ms = 1
+      const mode   = Number(parts[1]);           // 0 or 1
+      const speed  = Number(parts[2]);           // 0..100
+      if (!Number.isFinite(tsUnit) || !Number.isFinite(mode) || !Number.isFinite(speed)) continue;
+      const clampedMode  = (mode>=1)?1:0;
+      const clampedSpeed = Math.min(100, Math.max(0, Math.round(speed)));
+      out.push({ t_ms: tsUnit*100, mode: clampedMode, speed: clampedSpeed });
+    }
+    return out;
+  }
+
+  /*** シーク・再生状態に合わせたスケジューリング ***/
+  // 100msごとに動画の現在時刻(ms)とrows[rowIdx].t_msを比較し、到達したら送信
+  function startTicker(){
+    if (tickId) return;
+    tickId = setInterval(onTick, 100);
+  }
+  function stopTicker(){
+    if (!tickId) return;
+    clearInterval(tickId);
+    sendMotor(0, 0);//モーターを一時停止
+    tickId = 0;
+  }
+  function onTick(){
+    if (!rows.length || rowIdx >= rows.length) return;
+    const t_ms = Math.floor(video.currentTime * 1000);
+    while (rowIdx < rows.length && rows[rowIdx].t_ms <= t_ms){
+      const {mode, speed} = rows[rowIdx];
+      sendMotor(mode, speed);
+      rowIdx++;
+    }
+  }
+  function resetIndexToVideoTime(){
+    if (!rows.length) { rowIdx = 0; return; }
+    const t = Math.floor(video.currentTime * 1000);
+    // rows[rowIdx].t_ms <= t となる最後の位置を二分探索
+    let lo=0, hi=rows.length-1, ans=-1;
+    while (lo<=hi){
+      const mid=(lo+hi)>>1;
+      if (rows[mid].t_ms <= t){ ans=mid; lo=mid+1; } else { hi=mid-1; }
+    }
+    rowIdx = Math.max(0, ans+1);
+    log('Seek adjust → idx=', rowIdx, 'time=', t+'ms');
+  }
+
+  // 動画イベントに連動
+  video.addEventListener('play', startTicker);
+  video.addEventListener('pause', stopTicker);
+  video.addEventListener('seeking', ()=>{ /*一時停止中も走るので安全側*/ });
+  video.addEventListener('seeked', resetIndexToVideoTime);
+  video.addEventListener('ended', ()=>{ stopTicker(); log('Video ended'); });
+
+  /*** BLE 接続・送信 ***/
+  let device=null, server=null, characteristic=null;
+
+  $('#btnConnect').addEventListener('click', connectBLE);
+  $('#btnDisconnect').addEventListener('click', disconnectBLE);
+
+  async function connectBLE(){
+    const SERVICE_UUID = $('#svc').value.trim();
+    const CHAR_UUID    = $('#chr').value.trim();
+    try{
+      $('#bleState').textContent = 'scanning…';
+      device = await navigator.bluetooth.requestDevice({
+        acceptAllDevices: true,
+        optionalServices: [SERVICE_UUID]
+      });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+
+      server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      characteristic = await service.getCharacteristic(CHAR_UUID);
+
+      $('#bleState').textContent = 'connected';
+      $('#btnConnect').disabled = true;
+      $('#btnDisconnect').disabled = true; // 直後は押させない（誤連打対策）
+      setTimeout(()=>$('#btnDisconnect').disabled=false, 400);
+      const p = characteristic.properties||{};
+      log('BLE connected. props=', JSON.stringify(p));
+    }catch(e){
+      $('#bleState').textContent = 'error';
+      log('ERROR(connect):', e?.message||e);
+      cleanupBLE(false);
+    }
+  }
+  function onDisconnected(){
+    log('BLE disconnected.');
+    $('#bleState').textContent = 'disconnected';
+    cleanupBLE(true);
+  }
+  async function disconnectBLE(){
+    try{ device?.gatt?.disconnect?.(); }
+    catch(e){ log('ERROR(disconnect):', e?.message||e); }
+    finally{ cleanupBLE(true); }
+  }
+  function cleanupBLE(disconnected){
+    if (disconnected){ server=null; characteristic=null; }
+    $('#btnConnect').disabled = false;
+    $('#btnDisconnect').disabled = true;
+  }
+
+  function makeMotorByte(mode, speed){
+    const m = (mode?1:0);
+    const s = Math.min(100, Math.max(0, speed|0));
+    return ((m<<7)&0x80) | s;
+  }
+  async function sendMotor(mode, speed){
+    if (!characteristic) { log('skip(send): not connected'); return; }
+    try{
+      const motor = makeMotorByte(mode, speed);
+      const payload = new Uint8Array([0x01, 0x01, motor]);
+      if ('writeValueWithoutResponse' in characteristic &&
+          characteristic.properties?.writeWithoutResponse){
+        await characteristic.writeValueWithoutResponse(payload);
+        log(`TX (WNR): t=${Math.floor(video.currentTime*1000)}ms  mode=${mode} speed=${speed}  bytes=[01,01,${motor.toString(16).padStart(2,'0')}]`);
+      }else{
+        await characteristic.writeValue(payload);
+        log(`TX (WR ): t=${Math.floor(video.currentTime*1000)}ms  mode=${mode} speed=${speed}  bytes=[01,01,${motor.toString(16).padStart(2,'0')}]`);
+      }
+    }catch(e){
+      log('ERROR(write):', e?.message||e);
+    }
+  }
+
+  // 起動メッセージ
+  if (!('bluetooth' in navigator)){
+    log('このブラウザは Web Bluetooth API に未対応です。Bluefy / WebBLE など対応ブラウザを使用してください。');
+  }else{
+    log('手順: 1) 動画を選択  2) CSVを選択  3) Connect BLE  4) 再生すると時刻に応じて送信します。');
+  }
+})();
+</script>
+</body>
+</html>
